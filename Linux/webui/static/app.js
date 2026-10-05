@@ -414,6 +414,7 @@ async function loadSettings() {
     $("s-save-folder").value = gs.save_folder;
     $("s-split").value = gs.split_size || 0;
     $("s-keep-flv").checked = !!gs.keep_flv;
+    $("s-debug").checked = !!gs.debug;
     $("s-tolerance").value = gs.size_tolerance_mb ?? 25;
     $("s-host").value = gs.webui_host || "0.0.0.0";
     $("s-port").value = gs.webui_port || 6657;
@@ -450,6 +451,7 @@ async function saveSettings() {
       save_folder: $("s-save-folder").value.trim() || "Recordings",
       split_size: parseFloat($("s-split").value) || 0,
       keep_flv: $("s-keep-flv").checked,
+      debug: $("s-debug").checked,
       size_tolerance_mb: parseInt($("s-tolerance").value) || 0,
       webui_host: $("s-host").value.trim() || "0.0.0.0",
       webui_port: parseInt($("s-port").value) || 6657,

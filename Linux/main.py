@@ -90,7 +90,9 @@ def main():
         print(f"🦜 Web UI（外网）: http://{pub}:{port}", flush=True)
     else:
         print(f"🦜 Web UI（外网）: 未获取到（请自行使用 公网IP:{port} 访问）", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # log_config=None：禁止 uvicorn 用 dictConfig 清掉我们已配置的 handler
+    # （否则 _clearExistingHandlers 会 close 掉按天日志文件，后续写盘全部报错）
+    uvicorn.run(app, host=host, port=port, log_level="warning", log_config=None)
 
 
 if __name__ == "__main__":

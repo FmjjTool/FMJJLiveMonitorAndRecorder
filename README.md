@@ -67,6 +67,8 @@ curl -fsSL https://raw.githubusercontent.com/Refrain365/LiveMonitorAndRecorder/m
 - 📱 B站扫码登录自动获取并保存 Cookie
 - 🤖 开播 / 下播事件绑定自定义脚本
 - 🔐 可选 Web 访问口令，界面适配竖屏浏览
+- 📋 日志按天保存，设置页可开调试模式（DEBUG 详细报错 + 异常堆栈）
+- ⚙️ 重复执行安装命令即为更新模式：覆盖更新项目文件，用户配置保留
 - ⚙️ `bash install.sh --systemd` 一键创建开机自启服务
 
 详细安装、首次使用步骤与常见问题请阅读 [Linux/README.md](./Linux/README.md)。

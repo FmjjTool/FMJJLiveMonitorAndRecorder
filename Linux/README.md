@@ -32,6 +32,9 @@ Windows 版对齐；界面与交互为独立实现的 Web UI（不是 Tkinter �
 - B站扫码登录：页面生成二维码，手机 App 扫码确认后 Cookie 自动验证、保存并回填
 - 通知 / Cookie / 设置 三页集中管理全部配置
 - 可选访问口令保护；界面适配竖屏与窄窗口
+- 📋 运行日志按天保存到 `logs/monitor-YYYY-MM-DD.log`（保留30天自动清理）；
+  设置页可开「调试模式」——DEBUG 级详细日志（含模块:行号），异常自动记录完整堆栈；
+  ffmpeg 报错尾部、自动化脚本输出与退出码也会写入日志，排障不抓瞎
 
 **自动化**
 
@@ -47,8 +50,15 @@ curl -fsSL https://raw.githubusercontent.com/Refrain365/LiveMonitorAndRecorder/m
 
 仅安装 Linux 版：脚本会把仓库 `Linux/` 目录的内容下载到 **`./LiveMonitorAndRecorder/`**，
 并依次完成：Python3 检查（低于 3.8 会警告）→ ffmpeg（Ubuntu 走 apt；CentOS 系
-自动下载静态编译版到 `/usr/local/bin`）→ 创建 `.venv` 虚拟环境并安装全部 Python
-依赖 → 自动校验 → 注册全局命令 `live` → 打印启动方式。
+自动下载静态编译版到 `/usr/local/bin`）→ 创建 `.venv` 虚拟环境 → **pip 源自动测速**
+（清华 / 阿里 / 中科大 / 腾讯 / 官方 并行测速择快，一般镜像更快；安装失败自动换源重试，
+可用 `LMR_PIP_INDEX=https://pypi.org/simple` 强制指定）安装依赖 → 自动校验 →
+注册全局命令 `live` → 打印启动方式。
+
+- **已经安装过？重复执行同一条命令即为更新模式**（项目目录或引导落点
+  `./LiveMonitorAndRecorder` 均可识别）：下载最新代码**逐文件对比，只有内容变化的才覆盖**，
+  `config/`、`logs/`、`Recordings/`、`.venv/` 一律跳过，用户配置绝不覆盖；
+  `install.sh` 走原子替换（正在运行的实例不受影响，下次运行生效）
 
 - 下载前会**自动测速选择最快源**：直连 GitHub +44 个社区镜像（ghproxy 前缀形态）
   并行探测首字节延迟，最快者优先、失败自动按序切换；也可强制指定：
@@ -149,7 +159,7 @@ Linux/
 ├── requirement.txt    # Python 依赖清单
 ├── webui/             # FastAPI 路由 + 静态单页前端
 ├── config/config.json # 运行配置（含 Cookie，已被 .gitignore 排除）
-├── logs/              # 按天滚动日志
+├── logs/              # 按天日志 monitor-YYYY-MM-DD.log（30天自动清理）
 └── Recordings/        # 录播产出
     └── 抖音|哔哩哔哩/<主播名>/<YYYY-MM-DD(UTC+8)>/<HH-MM-SS>.mp4
 ```

@@ -36,7 +36,7 @@ class AutomationRunner:
                     with self._lock:
                         self._running_keys.discard(key)
             except Exception as e:
-                logger.error(f"[自动化] 任务队列异常: {e}")
+                logger.error(f"[自动化] 任务队列异常: {e}", exc_info=True)
 
     def _run_script(self, script, key):
         if not script or not os.path.exists(script):
@@ -51,10 +51,29 @@ class AutomationRunner:
                 logger.warning(f"[自动化] 不支持的脚本类型: {script}（仅支持 .py / .sh）")
                 return
             logger.info(f"[自动化] 触发脚本: {script}")
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+            threading.Thread(target=self._watch_script, args=(script, proc),
+                             daemon=True, name="automation-watch").start()
         except Exception as e:
-            logger.error(f"[自动化] 脚本执行失败 {script}: {e}")
+            logger.error(f"[自动化] 脚本执行失败 {script}: {e}", exc_info=True)
+
+    @staticmethod
+    def _watch_script(script, proc):
+        """收集脚本输出：非零退出 ERROR 带输出尾部（详细报错），
+        正常输出走 DEBUG（调试模式可见）。长驻脚本会占用一个 daemon 线程等待，属预期行为。"""
+        try:
+            out, _ = proc.communicate()
+            text = (out or b"").decode("utf-8", "replace").strip()
+            if proc.returncode != 0:
+                logger.error(f"[自动化] 脚本退出码 {proc.returncode}: {script}"
+                             + (f"\n输出尾部:\n{text[-1500:]}" if text else "（无输出）"))
+            elif text:
+                logger.debug(f"[自动化] {script} 输出:\n{text[-1500:]}")
+            else:
+                logger.debug(f"[自动化] 脚本正常结束: {script}")
+        except Exception as e:
+            logger.error(f"[自动化] 脚本输出读取失败 {script}: {e}", exc_info=True)
 
     def check_automation(self, streamer, trigger):
         """主播状态变化时调用。trigger: "直播中" / "未开播"（复刻 Win 12469 的匹配规则）"""

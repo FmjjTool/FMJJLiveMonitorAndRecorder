@@ -212,6 +212,8 @@ def create_app(monitor):
         if "automations" in body:
             cfg.data["automations"] = body["automations"]
         cfg.save()
+        # 调试模式即时生效（无需重启）
+        monitor.apply_debug(bool(cfg.data["global_settings"].get("debug", False)))
         return {"ok": True}
 
     class PasswordBody(BaseModel):
@@ -249,6 +251,8 @@ def create_app(monitor):
         try:
             data = qrlogin.qr_generate()
         except Exception as e:
+            from monitor import logger
+            logger.error(f"[扫码] 申请二维码失败: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=f"申请二维码失败: {e}")
         sid = secrets.token_hex(8)
         _qr_sessions[sid] = data["qrcode_key"]
@@ -296,7 +300,7 @@ def create_app(monitor):
             return {"status": r["status"], "saved": False, "message": r["message"]}
         except Exception as e:
             # 任何异常都不让前端 500：如实报错，保留会话供下轮重试
-            logger.error(f"[扫码] 状态查询异常: {e}")
+            logger.error(f"[扫码] 状态查询异常: {e}", exc_info=True)
             return {"status": "error", "saved": False, "message": f"服务端异常: {e}"}
 
     # ---------- 录播文件管理 ----------
@@ -304,9 +308,9 @@ def create_app(monitor):
     @app.get("/api/files", dependencies=[Depends(auth)])
     def list_files():
         """按保存目录格式返回录播树：平台 → 主播 → 日期 → 文件（含大小）。"""
-        from monitor import PLATFORM_DIRS
+        from monitor import PLATFORM_DIRS, data_path
         folder = cfg.global_settings.get("save_folder", "Recordings")
-        root = os.path.abspath(folder)
+        root = data_path(folder)
         platforms = []
         for key, label in PLATFORM_DIRS.items():
             pdir = os.path.join(root, label)
@@ -349,8 +353,9 @@ def create_app(monitor):
     @app.get("/api/files/download", dependencies=[Depends(auth)])
     def download_file(path: str, request: Request):
         """下载录播文件，支持 HTTP Range（断点续传，206/416 语义完整）。"""
+        from monitor import data_path
         folder = cfg.global_settings.get("save_folder", "Recordings")
-        root = os.path.abspath(folder)
+        root = data_path(folder)
         full = os.path.realpath(os.path.join(root, path))
         if not (full == root or full.startswith(root + os.sep)):
             raise HTTPException(status_code=400, detail="非法路径")

@@ -44,6 +44,7 @@ def _default_config():
             "size_tolerance_mb": 25,
             "split_size": 0,
             "sleep_periods": [],
+            "debug": False,
             "webui_password": "",
             "webui_host": "0.0.0.0",
             "webui_port": 6657,

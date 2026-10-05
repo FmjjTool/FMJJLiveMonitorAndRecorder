@@ -64,11 +64,24 @@ elif command -v yum >/dev/null 2>&1; then
   PKG="yum"
 fi
 
-# ----------1.5 项目自举：单独下载本脚本时，自动拉取 Linux 版内容 ----------
-# 判据：脚本同目录没有 main.py → 不是完整项目目录。
-# 内容取自仓库 Linux/ 目录，落地目录固定命名为 LiveMonitorAndRecorder。
-if [ ! -f "$SCRIPT_DIR/main.py" ]; then
-  if ! command -v curl >/dev/null 2>&1; then
+# ----------1.5 项目内容：全新安装 / 更新已有安装 ----------
+# 识别是否已安装（两处落点都算）：
+#   脚本同目录有 main.py            → 更新模式，目标 = 脚本同目录
+#   同目录 LiveMonitorAndRecorder/  → 引导安装落点，重复执行安装命令 = 更新模式
+#   都没有                          → 全新安装到 ./LiveMonitorAndRecorder/
+# 更新模式：下载最新包，对比覆盖项目文件；config/ logs/ Recordings/ .venv 保留不动
+# 下载源自动测速（直连 + 镜像前缀），archive 带时间戳防镜像旧缓存。
+if [ -f "$SCRIPT_DIR/main.py" ]; then
+  INSTALL_MODE="更新"
+  TARGET="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/LiveMonitorAndRecorder/main.py" ]; then
+  INSTALL_MODE="更新"
+  TARGET="$SCRIPT_DIR/LiveMonitorAndRecorder"
+else
+  INSTALL_MODE="全新安装"
+  TARGET="$SCRIPT_DIR/LiveMonitorAndRecorder"
+fi
+if ! command -v curl >/dev/null 2>&1; then
     log "安装 curl 以便下载项目文件 ..."
     case "$PKG" in
       apt-get) as_root apt-get update -y && as_root apt-get install -y curl ;;
@@ -137,7 +150,7 @@ if [ ! -f "$SCRIPT_DIR/main.py" ]; then
   fi
   BOOT_TMP="$(mktemp -d)"
   TMP_DIRS="$TMP_DIRS $BOOT_TMP"
-  TARGET="$SCRIPT_DIR/LiveMonitorAndRecorder"
+  # 注意：目标目录 TARGET 已在上方按安装模式设定，这里不再覆盖
 
   # 首字节延迟探测：range 请求第1个字节，4 秒超时，成功输出耗时（秒）
   probe_ttfb() {
@@ -211,6 +224,58 @@ if [ ! -f "$SCRIPT_DIR/main.py" ]; then
   done
 
   DOWNLOADED=0
+  # 把解压出的项目文件覆盖到目标目录（全新安装 / 更新共用）：
+  #   - 逐文件对比（cmp），只有内容不同才覆盖并记录
+  #   - 用户数据目录 config/ logs/ Recordings/ .venv/ __pycache__ 一律跳过，绝不覆盖用户配置
+  #   - install.sh 用「临时文件+原子替换」，不影响正在运行的实例
+  UPDATED_N=0
+  apply_update() {
+    local src="$1" dst="$2" entry name sub sname
+    mkdir -p "$dst"
+    for entry in "$src"/* "$src"/.[!.]*; do
+      [ -e "$entry" ] || continue
+      name="$(basename "$entry")"
+      case "$name" in
+        # install.sh 不走普通覆盖：留给末尾的原子替换块（避免覆盖正在执行的脚本）
+        config | logs | Recordings | .venv | __pycache__ | install.sh) continue ;;
+      esac
+      if [ -d "$entry" ]; then
+        mkdir -p "$dst/$name"
+        for sub in "$entry"/* "$entry"/.[!.]*; do
+          [ -e "$sub" ] || continue
+          sname="$(basename "$sub")"
+          case "$sname" in __pycache__) continue ;; esac
+          if [ -d "$sub" ]; then
+            mkdir -p "$dst/$name/$sname"
+            cp -a "$sub"/. "$dst/$name/$sname"/ 2>/dev/null || warn "跳过目录复制: $name/$sname"
+          elif ! cmp -s "$sub" "$dst/$name/$sname" 2>/dev/null; then
+            if cp -f "$sub" "$dst/$name/$sname"; then
+              UPDATED_N=$((UPDATED_N + 1))
+              log "  更新文件: $name/$sname"
+            else
+              warn "复制失败（跳过）: $name/$sname"
+            fi
+          fi
+        done
+      elif ! cmp -s "$entry" "$dst/$name" 2>/dev/null; then
+        if cp -f "$entry" "$dst/$name"; then
+          UPDATED_N=$((UPDATED_N + 1))
+          log "  更新文件: $name"
+        else
+          warn "复制失败（跳过）: $name"
+        fi
+      fi
+    done
+    # install.sh 原子替换：正在运行的实例不受影响，下次运行生效
+    if ! cmp -s "$src/install.sh" "$dst/install.sh" 2>/dev/null; then
+      if cp -f "$src/install.sh" "$dst/install.sh.new" && mv -f "$dst/install.sh.new" "$dst/install.sh"; then
+        UPDATED_N=$((UPDATED_N + 1))
+        log "  更新文件: install.sh（下次运行生效）"
+      else
+        warn "install.sh 更新失败（不影响其他文件）"
+      fi
+    fi
+  }
   for br in $LMR_BRANCHES; do
     # ?cb=时间戳：绕过镜像对 archive 的旧缓存（GitHub 忽略该参数，直连不受影响）
     FULL_URL="https://github.com/Refrain365/LiveMonitorAndRecorder/archive/refs/heads/${br}.tar.gz?cb=$(date +%s)"
@@ -223,8 +288,14 @@ if [ ! -f "$SCRIPT_DIR/main.py" ]; then
         if tar -xzf "$BOOT_TMP/lmr.tar.gz" -C "$BOOT_TMP/x" 2>/dev/null; then
           SRC="$(find "$BOOT_TMP/x" -maxdepth 3 -type d -name Linux | head -1)"
           if [ -n "$SRC" ] && [ -f "$SRC/main.py" ]; then
-            mkdir -p "$TARGET"
-            cp -a "$SRC"/. "$TARGET"/
+            if [ "$INSTALL_MODE" = "更新" ]; then
+              log "检测到已有安装，进入更新模式 ..."
+            else
+              log "安装项目文件到 $TARGET ..."
+            fi
+            # 全新安装 / 更新统一走 apply_update：逐文件对比覆盖、跳过用户数据目录，
+            # 即使目录里已有残留（半截安装）也不会覆盖用户的 config/
+            apply_update "$SRC" "$TARGET"
             DOWNLOADED=1
             break
           fi
@@ -237,25 +308,32 @@ if [ ! -f "$SCRIPT_DIR/main.py" ]; then
     fi
   done
   if [ "$DOWNLOADED" -ne 1 ]; then
-    err "项目内容下载失败（全部源均不可用）。可手动克隆："
-    err "  git clone https://github.com/Refrain365/LiveMonitorAndRecorder.git LiveMonitorAndRecorder"
-    err "  然后执行 LiveMonitorAndRecorder/Linux/install.sh"
-    exit 1
+    if [ "$INSTALL_MODE" = "更新" ]; then
+      warn "更新下载失败，继续使用当前版本完成安装（可稍后重试更新）"
+    else
+      err "项目内容下载失败（全部源均不可用）。可手动克隆："
+      err "  git clone https://github.com/Refrain365/LiveMonitorAndRecorder.git LiveMonitorAndRecorder"
+      err "  然后执行 LiveMonitorAndRecorder/Linux/install.sh"
+      exit 1
+    fi
+  else
+    if [ "$INSTALL_MODE" = "更新" ]; then
+      log "项目文件已更新（共 $UPDATED_N 个文件有变化；config / logs / Recordings / .venv 保留未动）"
+    else
+      log "已下载到: $TARGET（项目文件 $UPDATED_N 个；config / logs / Recordings 不随包覆盖，首次启动生成）"
+    fi
   fi
-  log "已下载到: $TARGET（目录名 LiveMonitorAndRecorder）"
   rm -rf "$BOOT_TMP"
   if [ ! -f "$TARGET/main.py" ]; then
     err "下载内容异常（缺少 main.py），请稍后重试或手动克隆："
     err "  git clone https://github.com/Refrain365/LiveMonitorAndRecorder.git LiveMonitorAndRecorder"
     exit 1
   fi
-  # 直接切换工作目录，继续执行本脚本剩余步骤：
-  # 不依赖压缩包内是否包含 install.sh（镜像可能缓存合并前的旧包），
+  # 切换工作目录，继续执行本脚本剩余步骤：
   # --systemd 等参数与 LMR_* 环境变量在本进程内天然保留。
   SCRIPT_DIR="$TARGET"
   cd "$SCRIPT_DIR" || { err "无法进入项目目录: $SCRIPT_DIR"; exit 1; }
-  log "已切换到项目目录，继续安装 ..."
-fi
+  log "已切换到项目目录: $SCRIPT_DIR（模式: $INSTALL_MODE）"
 
 OS_NAME="unknown"
 if [ -r /etc/os-release ]; then
@@ -361,9 +439,82 @@ if [ ! -x .venv/bin/python ]; then
     python3 -m venv .venv || { err "虚拟环境创建失败，请检查 python3-venv/virtualenv"; exit 1; }
   fi
 fi
-log "安装 Python 依赖（fastapi / streamlink / qrcode 等）..."
-.venv/bin/pip install -q --upgrade pip
-.venv/bin/pip install -q -r requirement.txt
+# PyPI 源自动测速：镜像 / 官方 并行探测、择快使用（国内一般镜像更快，以实测为准）。
+# 可用环境变量强制指定、跳过测速： .../install.sh | LMR_PIP_INDEX=https://pypi.org/simple bash
+PIP_INDEXES=(
+  "https://pypi.tuna.tsinghua.edu.cn/simple"
+  "https://mirrors.aliyun.com/pypi/simple/"
+  "https://mirrors.ustc.edu.cn/pypi/simple/"
+  "https://mirrors.cloud.tencent.com/pypi/simple"
+  "https://pypi.org/simple"
+)
+if [ -n "${LMR_PIP_INDEX:-}" ]; then
+  PIP_INDEXES=("$LMR_PIP_INDEX")
+  log "使用指定 PyPI 源: $LMR_PIP_INDEX"
+fi
+
+# 探测延迟：请求源的 pip/ 索引页，4 秒超时，成功输出耗时（秒）
+probe_pip() {
+  local out
+  out=$(curl -sS -o /dev/null --max-time 4 -w '%{http_code} %{time_total}' "$1/pip/" 2>/dev/null) || return 1
+  case "$out" in
+    200\ *) printf '%s' "$out" | awk '{print $2}' ;;
+    *) return 1 ;;
+  esac
+}
+
+PI_DIR="$(mktemp -d)"
+TMP_DIRS="$TMP_DIRS $PI_DIR"
+i=0
+for idx in "${PIP_INDEXES[@]}"; do
+  ( t=$(probe_pip "$idx") && printf '%s' "$t" >"$PI_DIR/$i" ) &
+  i=$((i + 1))
+done
+wait || true
+best_pi=""
+best_t=999999
+i=0
+for idx in "${PIP_INDEXES[@]}"; do
+  if [ -f "$PI_DIR/$i" ]; then
+    t="$(cat "$PI_DIR/$i")"
+    if awk -v a="$t" -v b="$best_t" 'BEGIN { exit !(a < b) }'; then
+      best_t="$t"
+      best_pi="$idx"
+    fi
+  fi
+  i=$((i + 1))
+done
+rm -rf "$PI_DIR"
+if [ -n "$best_pi" ]; then
+  log "PyPI 源测速完成，最快: $best_pi（耗时 ${best_t}s）"
+else
+  warn "PyPI 源测速全部失败，将按列表顺序逐个尝试"
+fi
+
+# 安装依赖：最快源优先，失败自动切换下一个源
+pip_install_deps() {
+  local idx order=()
+  if [ -n "$best_pi" ]; then
+    order+=("$best_pi")
+  fi
+  for idx in "${PIP_INDEXES[@]}"; do
+    if [ "$idx" != "$best_pi" ]; then
+      order+=("$idx")
+    fi
+  done
+  for idx in "${order[@]}"; do
+    log "pip 安装依赖（源: $idx）..."
+    if .venv/bin/pip install -q --upgrade pip -i "$idx" \
+       && .venv/bin/pip install -q -r requirement.txt -i "$idx"; then
+      best_pi="$idx"
+      return 0
+    fi
+    warn "pip 源失败: $idx，尝试下一个 ..."
+  done
+  err "所有 PyPI 源均安装失败，请检查网络后重试"
+  exit 1
+}
+pip_install_deps
 
 # ---------- 5. 安装校验 ----------
 log "校验安装结果..."

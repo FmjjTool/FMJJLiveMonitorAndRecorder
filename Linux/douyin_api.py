@@ -8,11 +8,14 @@
 全部为纯 requests 实现，无浏览器依赖。
 """
 import json
+import logging
 import random
 import re
 from urllib.parse import unquote
 
 import requests
+
+logger = logging.getLogger("douyin")
 
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
@@ -89,6 +92,7 @@ def _parse_stream_data(stream_data_str):
             stream_data = json.loads(stream_data)
         return _clean_url(stream_data.get("data", {}).get("origin", {}).get("main", {}).get("flv", "") or "")
     except Exception:
+        logger.debug("stream_data 解析失败（无 origin 直链）", exc_info=True)
         return ""
 
 
@@ -112,6 +116,7 @@ def _extract_render_data(page_text):
     try:
         obj = json.loads(decoded)
     except Exception:
+        logger.debug("RENDER_DATA JSON 解析失败", exc_info=True)
         return result
     flv_pull = _recursive_find(obj, "flv_pull_url")
     if isinstance(flv_pull, dict):
@@ -173,7 +178,7 @@ def _parse_enter_response(resp_body):
             if hls:
                 result["原画"] = _clean_url(hls)
     except Exception:
-        pass
+        logger.debug("enter 响应解析失败", exc_info=True)
     return result
 
 
@@ -195,9 +200,11 @@ def _request_enter(web_rid, headers):
         resp.encoding = "utf-8"
         data = resp.json()
         if "data" not in data:
+            logger.debug(f"[抖音] enter 接口无 data（web_rid={web_rid}）: {str(data)[:200]}")
             return None
         return data
     except Exception:
+        logger.debug(f"[抖音] enter 接口请求失败（web_rid={web_rid}）", exc_info=True)
         return None
 
 
@@ -209,7 +216,7 @@ def _room_status_from_enter(data):
         if data_list and isinstance(data_list[0].get("status"), int):
             return data_list[0]["status"] == 2
     except Exception:
-        pass
+        logger.debug("enter 响应中未取到权威房间状态", exc_info=True)
     return None
 
 
@@ -259,6 +266,7 @@ def check_douyin_live(douyin_id, monitor_cookie):
             return m.group(1) == "1"
         return "直播中" in resp.text
     except Exception:
+        logger.debug(f"[抖音] 页面兜底检测失败（{douyin_id}）", exc_info=True)
         return None
 
 
@@ -314,6 +322,7 @@ def _share_user_info(sec_uid, monitor_cookie=""):
             out["sec_uid"] = mm.group(1)
         return out
     except Exception:
+        logger.debug(f"[抖音] 分享页解析失败（sec_uid={sec_uid}）", exc_info=True)
         return {}
 
 
@@ -332,6 +341,7 @@ def _user_page_web_rid(sec_uid, monitor_cookie):
              or re.search(r'live\.douyin\.com/(\d{6,})', t))
         return m.group(1) if m else ""
     except Exception:
+        logger.debug(f"[抖音] 用户页 web_rid 解析失败（sec_uid={sec_uid}）", exc_info=True)
         return ""
 
 
@@ -447,6 +457,7 @@ def fetch_stream_urls_by_rid(web_rid, record_cookie, quality="原画"):
     data = _request_enter(str(web_rid), headers)
     if data is not None:
         all_urls.update(_parse_enter_response(data))
+    logger.debug(f"[抖音] enter 接口画质: {sorted(all_urls) or '无，转页面解析'}")
 
     if not all_urls:
         # enter 失败：抓页面解析（RENDER_DATA / web_rid→enter / 正则兜底）
@@ -455,15 +466,18 @@ def fetch_stream_urls_by_rid(web_rid, record_cookie, quality="原画"):
             resp.encoding = "utf-8"
             page_text = resp.text
         except Exception:
+            logger.debug(f"[抖音] 直播间页面请求失败（web_rid={web_rid}）", exc_info=True)
             return {"url": "", "is_hls": False, "all": {}}
         all_urls.update(_extract_render_data(page_text))
         for q, u in _fetch_enter_interface(page_text, headers).items():
             all_urls.setdefault(q, u)
         for q, u in _regex_fallback_urls(page_text).items():
             all_urls.setdefault(q, u)
+        logger.debug(f"[抖音] 页面解析画质: {sorted(all_urls) or '无'}")
 
     picked = all_urls.get(quality) or all_urls.get("原画") or ""
     is_hls = picked.endswith(".m3u8") or ".m3u8" in picked
+    logger.debug(f"[抖音] 目标画质 {quality} 选中: {picked[:80] or '未获取到'}")
     return {"url": picked, "is_hls": is_hls, "all": all_urls}
 
 
@@ -471,6 +485,7 @@ def fetch_stream_urls_for_streamer(streamer, monitor_cookie, record_cookie, qual
     """按主播档案抓直链：先解析当前 web_rid，再走 enter 接口。"""
     rid = get_douyin_web_rid(streamer, monitor_cookie)
     if not rid:
+        logger.debug(f"[抖音] {streamer.get('name')} 未解析到 web_rid，无法抓直链")
         return {"url": "", "is_hls": False, "all": {}}
     return fetch_stream_urls_by_rid(rid, record_cookie, quality)
 
@@ -485,7 +500,7 @@ def check_bilibili_live(room_id):
         if data.get("code") == 0:
             return data["data"]["live_status"] == 1, data["data"].get("title", "直播间")
     except Exception:
-        pass
+        logger.debug(f"[B站] 开播检测失败（room_id={room_id}）", exc_info=True)
     return None, ""
 
 
@@ -516,7 +531,7 @@ def _bili_card_info(uid):
             card = r.get("data", {}).get("card", {})
             return card.get("name", ""), str(r.get("data", {}).get("roomid") or "")
     except Exception:
-        pass
+        logger.debug(f"[B站] 用户卡片接口失败（uid={uid}）", exc_info=True)
     return "", ""
 
 
@@ -531,7 +546,7 @@ def _bili_room_info_old(uid):
             if m:
                 return m.group(1)
     except Exception:
-        pass
+        logger.debug(f"[B站] getRoomInfoOld 失败（uid={uid}）", exc_info=True)
     return ""
 
 
@@ -551,7 +566,7 @@ def resolve_bilibili_streamer(raw):
             if r.get("code") == 0:
                 uid = str(r.get("data", {}).get("uid") or "")
         except Exception:
-            pass
+            logger.debug(f"[B站] 房间信息反查 UID 失败（room_id={room_id}）", exc_info=True)
         name, _ = _bili_card_info(uid) if uid else ("", "")
         return {"name": name, "room_id": room_id, "uid": uid}
     if t["type"] == "uid":

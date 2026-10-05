@@ -47,6 +47,15 @@ SIZE_TOLERANCE_MB = 25          # MP4 比 FLV 小超过此值视为转码不完�
 TZ_CN = timezone(timedelta(hours=8))  # 录制目录按 UTC+8 归档
 PLATFORM_DIRS = {"douyin": "抖音", "bilibili": "哔哩哔哩"}
 
+# 项目目录（Linux/）：日志与录制产物锚定到这里，与启动位置（systemd / live 命令）无关
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def data_path(path):
+    """相对路径锚定到项目目录；绝对路径原样返回。"""
+    p = str(path or "").strip()
+    return p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
+
 
 def _now_cn():
     return datetime.now(TZ_CN)
@@ -90,10 +99,48 @@ class RecordTask:
         self.stream_url = ""
         self.is_hls = False
         self.error = ""
+        self.err_tail = deque(maxlen=40)   # 录制进程 stderr 尾部（排障用）
 
     @property
     def is_alive(self):
         return self.process is not None and self.process.poll() is None
+
+
+class DailyFileHandler(logging.Handler):
+    """按天写入 logs/monitor-YYYY-MM-DD.log，跨天自动切换新文件。"""
+
+    def __init__(self, log_dir, prefix="monitor"):
+        super().__init__()
+        self.log_dir = log_dir
+        self.prefix = prefix
+        self._file = None
+        self._date = ""
+
+    def emit(self, record):
+        day = time.strftime("%Y-%m-%d", time.localtime(record.created))
+        if self._file is None or day != self._date:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+            self._date = day
+            os.makedirs(self.log_dir, exist_ok=True)
+            self._file = open(os.path.join(self.log_dir, f"{self.prefix}-{day}.log"),
+                              "a", encoding="utf-8")
+        try:
+            self._file.write(self.format(record) + "\n")
+            self._file.flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+        super().close()
 
 
 class LiveMonitor:
@@ -112,22 +159,43 @@ class LiveMonitor:
 
     def _setup_logging(self):
         root = logging.getLogger()
-        root.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+        self._fmt_info = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+        self._fmt_debug = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d %(message)s", "%Y-%m-%d %H:%M:%S")
         ring = self.log_ring
-        ring.setFormatter(fmt)
         root.handlers.clear()
         root.addHandler(ring)
-        # 按天分割日志文件（复刻 Windows enable_daily_log_split 行为）
-        log_dir = "logs"
+        # 按天一个 .log：<项目目录>/logs/monitor-YYYY-MM-DD.log（30 天前自动清理）。
+        # 目录锚定项目目录而非当前工作目录，任意位置启动都写到本地固定位置
+        log_dir = data_path("logs")
         os.makedirs(log_dir, exist_ok=True)
-        fh = logging.handlers.TimedRotatingFileHandler(
-            os.path.join(log_dir, "monitor.log"), when="midnight", backupCount=30, encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        self._daily = DailyFileHandler(log_dir, "monitor")
+        root.addHandler(self._daily)
         console = logging.StreamHandler()
-        console.setFormatter(fmt)
         root.addHandler(console)
+        self._handlers = [ring, self._daily, console]
+        self.apply_debug(bool(self.cfg.global_settings.get("debug", False)))
+        self._prune_old_logs(log_dir)
+
+    def apply_debug(self, enabled):
+        """切换 DEBUG/INFO：级别 + 详细格式（含模块:行号），Web UI 设置即时生效。"""
+        fmt = self._fmt_debug if enabled else self._fmt_info
+        for h in self._handlers:
+            h.setFormatter(fmt)
+        logging.getLogger().setLevel(logging.DEBUG if enabled else logging.INFO)
+        logger.info(f"日志级别: {'DEBUG（详细报错）' if enabled else 'INFO'}")
+
+    @staticmethod
+    def _prune_old_logs(log_dir, keep_days=30):
+        try:
+            cutoff = time.time() - keep_days * 86400
+            for f in os.listdir(log_dir):
+                p = os.path.join(log_dir, f)
+                if f.startswith("monitor-") and f.endswith(".log") \
+                        and os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+        except Exception:
+            pass
 
     def get_log_tail(self, lines=200):
         buf = list(self.log_ring.buffer)
@@ -194,6 +262,7 @@ class LiveMonitor:
                             status_changed = True  # 房间号更新了（重开直播），需要持久化
                         if is_live is None:
                             continue
+                    logger.debug(f"[监控] {s['name']} 检测结果: {'直播中' if is_live else '未播'}")
                     if is_live and not prev:
                         logger.info(f"🔴 {s['name']} 开播")
                         status_changed = True
@@ -216,7 +285,7 @@ class LiveMonitor:
                     self.cfg.save_streamer_status()
                 self._sleep_chunk(total_cycle)
             except Exception as e:
-                logger.error(f"[监控] 循环异常: {e}")
+                logger.error(f"[监控] 循环异常: {e}", exc_info=True)
                 self._sleep_chunk(10)
 
     @staticmethod
@@ -243,7 +312,7 @@ class LiveMonitor:
     def _save_dir(self, streamer):
         """保存目录：<save_folder>/<抖音|哔哩哔哩>/<主播名>/<YYYY-MM-DD(UTC+8)>/
         同一天多次直播的录制文件都归档到同一个日期文件夹。"""
-        folder = self.cfg.global_settings.get("save_folder", "Recordings")
+        folder = data_path(self.cfg.global_settings.get("save_folder", "Recordings"))
         platform_dir = PLATFORM_DIRS.get(streamer.get("platform"), streamer.get("platform", "抖音"))
         day = _now_cn().strftime("%Y-%m-%d")
         path = os.path.join(folder, platform_dir, _safe_filename(streamer["name"]), day)
@@ -308,6 +377,45 @@ class LiveMonitor:
             cmd += ["--max-file-size", str(int(split_gb * 1024)) + "M"]
         return cmd
 
+    @staticmethod
+    def _mask_cmd(cmd):
+        """调试输出命令行时掩码 Cookie，避免凭据写进日志。"""
+        out, hide = [], False
+        for a in cmd:
+            if hide:
+                a = re.sub(r"(?i)(cookie[:=]\s*)[^\r\n]*", r"\1***", a)
+                hide = False
+            elif a in ("-headers", "--http-header"):
+                hide = True
+            out.append(a)
+        return " ".join(out)
+
+    @staticmethod
+    def _pump_stderr(task, stderr):
+        """持续读取录制进程 stderr 到环形缓冲：DEBUG 模式逐行输出，
+        进程异常退出时由守护线程把尾部写进日志（排障关键信息）。
+        stderr 作为参数持有句柄：重连替换 task.process 后旧线程不会误读新管道。"""
+        try:
+            for raw in iter(stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if not line:
+                    continue
+                task.err_tail.append(line)
+                logger.debug(f"[录制] {task.streamer['name']} stderr: {line}")
+        except Exception:
+            pass
+        finally:
+            try:
+                stderr.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _err_tail_text(task, n=3):
+        """stderr 尾部拼成一段文本，附在错误日志后。"""
+        tail = [x for x in list(task.err_tail)[-n:] if x]
+        return " | ".join(tail)
+
     def _launch_process(self, task, streamer):
         """抓直链（抖音）并启动录制进程。成功返回 True。"""
         if task.platform == "douyin":
@@ -317,7 +425,7 @@ class LiveMonitor:
                 self.cfg.cookies.get("douyin_record", ""),
                 task.quality)
             if not res["url"]:
-                task.error = "未获取到直播流直链"
+                task.error = "未获取到直播流直链（检查录播 Cookie 是否失效 / 主播是否在播）"
                 return False
             task.stream_url = res["url"]
             task.is_hls = res["is_hls"]
@@ -329,15 +437,19 @@ class LiveMonitor:
             task.raw_ext = ".ts"
             cmd = self._build_bili_cmd(task, streamer)
         try:
-            task.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                            start_new_session=True)
+            logger.debug(f"[录制] 启动命令: {self._mask_cmd(cmd)}")
+            task.err_tail.clear()
+            task.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.PIPE, start_new_session=True)
+            threading.Thread(target=self._pump_stderr, args=(task, task.process.stderr), daemon=True,
+                             name=f"fferr-{streamer['name']}").start()
             task.state = "录制中"
             task.started_at = _now_cn()
             task.error = ""
             return True
         except FileNotFoundError as e:
             task.error = f"找不到可执行程序（请确认 ffmpeg/streamlink 已安装）: {e}"
-            logger.error(f"[录制] {task.error}")
+            logger.error(f"[录制] {task.error}", exc_info=True)
             return False
 
     # ---------- 守护线程（2 秒轮询，复刻 Win 7777/7854） ----------
@@ -352,7 +464,7 @@ class LiveMonitor:
                     self._guard_task(name, task)
                 self._collect_finished_postprocessing()
             except Exception as e:
-                logger.error(f"[守护] 轮询异常: {e}")
+                logger.error(f"[守护] 轮询异常: {e}", exc_info=True)
 
     def _guard_task(self, name, task):
         if task.state == "转码中":
@@ -384,7 +496,9 @@ class LiveMonitor:
             if task.reconnect_attempts >= RECONNECT_MAX_ATTEMPTS:
                 # 30s 窗口内重试耗尽 → 放弃守护，等下播清理（复刻 Windows 行为）
                 if task.state != "失败":
-                    logger.warning(f"[守护] {name} 重连 {RECONNECT_MAX_ATTEMPTS} 次失败，放弃（等下播后重置）")
+                    tail = self._err_tail_text(task)
+                    logger.warning(f"[守护] {name} 重连 {RECONNECT_MAX_ATTEMPTS} 次失败，放弃（等下播后重置）"
+                                   + (f"；stderr: {tail}" if tail else ""))
                     task.state = "失败"
                 return
             if task.first_reconnect_time and now - task.first_reconnect_time > RECONNECT_WINDOW:
@@ -406,13 +520,17 @@ class LiveMonitor:
                 task.reconnect_attempts = 0
                 task.first_reconnect_time = None
             else:
-                logger.warning(f"[守护] {name} 抓流失败: {task.error}")
+                tail = self._err_tail_text(task)
+                logger.warning(f"[守护] {name} 抓流失败: {task.error}"
+                               + (f"；stderr: {tail}" if tail else ""))
             return
 
         # 进程已退出且非手动停止
         if still_live:
             # 自发断开且主播仍在播 → 走重连（冷却 6s）
-            logger.warning(f"[守护] {name} 录制进程意外退出（疑似断流），准备重连")
+            tail = self._err_tail_text(task)
+            logger.warning(f"[守护] {name} 录制进程意外退出（疑似断流），准备重连"
+                           + (f"；stderr: {tail}" if tail else ""))
             task.process = None
             task.state = "等待重连"
             task.next_retry_time = time.time() + RECONNECT_COOLDOWN
@@ -441,6 +559,8 @@ class LiveMonitor:
     def _postprocess(self, name, task, raw_path):
         try:
             if not raw_path or not os.path.exists(raw_path):
+                logger.warning(f"[转码] {name} 未找到录制文件，跳过封装"
+                               + (f"（期望路径: {raw_path}）" if raw_path else "（无输出路径）"))
                 with self._lock:
                     self.tasks.pop(name, None)
                 return
@@ -448,7 +568,7 @@ class LiveMonitor:
             if os.path.exists(mp4_path):
                 os.remove(mp4_path)
             r = subprocess.run(["ffmpeg", "-i", raw_path, "-c", "copy", mp4_path, "-y", "-loglevel", "error"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if r.returncode == 0 and os.path.exists(mp4_path):
                 raw_mb = os.path.getsize(raw_path) / 1024 / 1024
                 mp4_mb = os.path.getsize(mp4_path) / 1024 / 1024
@@ -461,9 +581,11 @@ class LiveMonitor:
                 else:
                     logger.info(f"📦 {name} 封装完成: {os.path.basename(mp4_path)}（保留原文件）")
             else:
-                logger.error(f"[转码] {name} MP4 封装失败，保留原始文件")
+                err = (r.stderr or b"").decode("utf-8", "replace").strip()
+                logger.error(f"[转码] {name} MP4 封装失败（exit={r.returncode}），保留原始文件"
+                             + (f"；ffmpeg: {err[-500:]}" if err else ""))
         except Exception as e:
-            logger.error(f"[转码] {name} 收尾异常: {e}")
+            logger.error(f"[转码] {name} 收尾异常: {e}", exc_info=True)
         finally:
             streamer = task.streamer
             if not streamer.get("last_status", False):

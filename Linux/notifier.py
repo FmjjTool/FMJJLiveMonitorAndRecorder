@@ -63,7 +63,7 @@ def send_wxpusher(app_token, uids, title, content):
         else:
             logger.warning(f"[通知] WxPusher 推送失败: {resp}")
     except Exception as e:
-        logger.error(f"[通知] WxPusher 推送异常: {e}")
+        logger.error(f"[通知] WxPusher 推送异常: {e}", exc_info=True)
 
 
 def send_wecom(webhook_url, title, content):
@@ -75,7 +75,7 @@ def send_wecom(webhook_url, title, content):
         else:
             logger.warning(f"[通知] 企业微信推送失败: {resp}")
     except Exception as e:
-        logger.error(f"[通知] 企业微信推送异常: {e}")
+        logger.error(f"[通知] 企业微信推送异常: {e}", exc_info=True)
 
 
 def send_notifications(cfg_data, title, content, streamer=None):
