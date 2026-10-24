@@ -1,6 +1,6 @@
 # LiveMonitorAndRecorder
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)](#) [![Python](https://img.shields.io/badge/python-3.8%2B-green)](#) [![License](https://img.shields.io/badge/license-%E4%BB%85%E4%BE%9B%E5%AD%A6%E4%B9%A0%E6%94%AF%E6%B5%81-orange)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)](#) [![Python](https://img.shields.io/badge/python-3.12%2B-green)](#) [![License](https://img.shields.io/badge/license-%E4%BB%85%E4%BE%9B%E5%AD%A6%E4%B9%A0%E6%94%AF%E6%B5%81-orange)](#)
 
 一个直播监控与录制助手：对主播直播状态进行监控提醒，开播后自动录制直播流，下播后无损封装为 MP4，并通过微信推送开播提醒。
 
